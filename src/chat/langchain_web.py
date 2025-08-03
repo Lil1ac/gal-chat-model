@@ -15,27 +15,28 @@ from langchain_core.messages import SystemMessage  # 从这里导入
 from langchain.schema import BaseMessage, HumanMessage, AIMessage
 
 
-# Retriever保持不变
 class GraphRAGRetriever(BaseRetriever):
     endpoint: str = "http://localhost:8100"
 
     def _get_relevant_documents(self, query: str) -> List[Document]:
         print(f"[检索器] 请求知识库接口，查询语句：{query}")
         try:
-            resp = requests.get(f"{self.endpoint}/search/local", params={"query": query}, timeout=10)
+            resp = requests.get(f"{self.endpoint}/search/local", params={"query": query}, timeout=15)
             resp.raise_for_status()
             data = resp.json()
             text = data.get("context_text", "") or data.get("response", "")
             text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
             text = re.sub(r"\[Data:.*?\]", "", text).strip()
-            # print(f"[检索器] 返回知识库文本：{text}")
+            print(f"[检索器] 返回知识库文本：{text}")
             return [Document(page_content=text)]
         except Exception as e:
             print(f"[检索器] 调用失败，异常：{e}")
-            return [Document(page_content=f"[GraphRAG调用失败] {e}")] 
+            return [Document(page_content=f"[GraphRAG调用失败] {e}")]
+
 
 from langchain_openai import ChatOpenAI
 from typing import Any, Dict, List
+
 
 class Qwen3ChatOpenAI(ChatOpenAI):
     def _call(self, messages: List[Dict[str, Any]], stop: List[str] = None, **kwargs) -> str:
@@ -47,6 +48,7 @@ class Qwen3ChatOpenAI(ChatOpenAI):
         # 调用父类方法，传递参数
         return super()._call(messages, stop=stop, **kwargs)
 
+
 base_llm = Qwen3ChatOpenAI(
     model="/root/autodl-tmp/unsloth/merged_model_no_think",
     temperature=0.7,
@@ -55,27 +57,41 @@ base_llm = Qwen3ChatOpenAI(
     api_key="dummy"
 )
 
+base_llm_qwen = Qwen3ChatOpenAI(
+    model="/root/autodl-tmp/Qwen/Qwen3-8B",
+    temperature=0.7,
+    streaming=True,
+    openai_api_base="http://localhost:8000/v1",
+    api_key="dummy"
+)
+
+# 使用base_llm创建转换chain
+from langchain.chains import LLMChain
+
 rewrite_prompt = PromptTemplate(
     input_variables=["history", "question"],
     template=(
         "你是一个智能搜索助手，帮助用户生成精准、简洁的知识库查询。\n"
+        "根据对话历史和直哉当前的问题，生成一句**精准、简洁**的知识库查询语句。"
+        "生成规则："
+        "1. 如果问题与具体角色或对象相关，直接围绕该对象生成查询。"
+        "2. 如果问题与心铃本人或心铃相关的关系、经历、想法有关，则重点突出心铃。"
+        "3. 保留亲密语气和对话关系背景，但不要无条件将所有查询都改成“心铃”。"
         "对话历史：{history}\n"
         "用户问题：{question}\n"
         "请只输出最终的查询语句，不要附加其他内容。"
     )
 )
-
-rewrite_chain = rewrite_prompt | base_llm
+rewrite_chain = LLMChain(llm=base_llm_qwen, prompt=rewrite_prompt)
 retriever = GraphRAGRetriever()
-
 memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
 system_message = SystemMessage(content=(
-    "我是本间心铃，游戏《樱之刻》中的女主角，圣卢安学院的学生。\n"
-    "我有一头黑色双马尾和棕色瞳孔，外貌与母亲中村丽华相似，举止得体，眼神锐利但温柔，"
+    "你是本间心铃，游戏《樱之刻》中的女主角，圣卢安学院的学生。\n"
+    "你有一头黑色双马尾和棕色瞳孔，举止得体，眼神锐利但温柔，"
     "性格乖巧且深思熟虑。\n"
-    "我擅长绘画，是一位天才画家，能够敏锐地辨识真伪，善于观察细节并体察他人心情。\n"
-    "我正在与直哉对话。\n"
+    "你擅长绘画，是一位天才画家，能够敏锐地辨识真伪，善于观察细节并体察他人心情。\n"
+    "你正在与直哉对话。\n"
 ))
 
 # **重点修改这里，必须包含 context，且声明 input_variables**
@@ -84,23 +100,32 @@ qa_prompt = ChatPromptTemplate.from_messages([
     MessagesPlaceholder(variable_name="chat_history"),
     ("human",
      "{question}\n"
-     "结合以下知识库线索，用我自己的话回答，不要直接照搬原文中的第一人称表达。"
-     "（可参考，可忽略）：{context}\n"
-     "请你用第一人称的口吻直接回应直哉，专注当前对话情绪，不要总结关系或分析立场，不要旁白式表达。")
+     "结合以下知识库线索，用你自己的话回答。"
+     "：{context}\n"
+     "（知识库仅作为参考，可忽略）请你用第一人称的口吻直接回应直哉。")
 ])
-
 qa_prompt.input_variables = ["question", "context", "chat_history"]  # 这里必须加，否则报错
-stuff_chain = create_stuff_documents_chain(llm=base_llm, prompt=qa_prompt)
+stuff_chain = LLMChain(llm=base_llm, prompt=qa_prompt)  # 你自己的QA prompt链
+
+# 新增一个把结构化关系转换成自然语言的Prompt和chain
+summary_prompt = PromptTemplate(
+    input_variables=["raw_knowledge"],
+    template=(
+        "请将以下结构化的知识点转换成连贯的自然语言描述，"
+        "使其更适合用作对话系统的知识库内容：\n\n"
+        "{raw_knowledge}\n\n"
+        "请用简洁流畅的语言表达，不要逐条罗列。"
+    )
+)
+
+summary_chain = LLMChain(llm=base_llm_qwen, prompt=summary_prompt)
 
 simple_chat_prompt = ChatPromptTemplate.from_messages([
     system_message,
     MessagesPlaceholder(variable_name="chat_history"),
-    ("human", "{question}")   # 直接传用户输入
+    ("human", "{question}")  # 直接传用户输入
 ])
-
 simple_chat_prompt.input_variables = ["question", "chat_history"]
-
-
 
 
 class GradioStreamCallback(BaseCallbackHandler):
@@ -117,7 +142,6 @@ class GradioStreamCallback(BaseCallbackHandler):
         return self.tokens
 
 
-
 def format_history_for_gradio(history: List[Tuple[str, str]]):
     """
     格式化聊天记录，给用户和助手的消息分别添加class，前端根据class区分左右气泡
@@ -125,7 +149,8 @@ def format_history_for_gradio(history: List[Tuple[str, str]]):
     msgs = []
     for user_text, bot_text in history:
         msgs.append({"role": "user", "content": user_text, "class_name": "chatbot-user"})
-        msgs.append({"role": "assistant", "content": bot_text, "class_name": "chatbot-assistant"})
+        styled_bot_text = process_cot_tags(add_cot_tags(bot_text))
+        msgs.append({"role": "assistant", "content": styled_bot_text, "class_name": "chatbot-assistant"})
     return msgs
 
 
@@ -134,23 +159,53 @@ def add_cot_tags(text: str) -> str:
     def replacer(match):
         inner = match.group(1)
         return f"<cot>{inner}</cot>"
+
     # 支持 ( ... ) 和 （ ... ）
     return re.sub(r'[（(](.*?)[）)]', replacer, text, flags=re.DOTALL)
-
-
 
 
 # ======= 处理 <cot> 标签，转成html带缩进的思考块 =======
 def process_cot_tags(text: str) -> str:
     level = 0
+
     def replace_cot(match):
         nonlocal level
         inner_text = match.group(1)
         current_level = level
         level += 1
         return f'<div class="thought-process cot-level-{current_level}"><i>💭 {inner_text}</i></div>'
+
     return re.sub(r'<cot>(.*?)</cot>', replace_cot, text, flags=re.DOTALL)
 
+
+def remove_inner_brackets(text: str) -> str:
+    """去掉括号及括号内容，用于TTS"""
+    return re.sub(r"[（(].*?[）)]", "", text)
+
+
+import requests
+
+
+def synthesize_speech(text: str, filename: str = "output.wav"):
+    local_url = "http://127.0.0.1:9880/tts"
+    print(f"[音频] 请求GPT-SOVITS，生成语音：{text}")
+    data = {
+        "text": text,
+        "text_lang": "zh",
+        "ref_audio_path": "/root/autodl-tmp/fem_mis_00051.ogg",
+        "prompt_text": "初対面で色々とはぐらかされると，あまりいい気分ではありません",
+        "prompt_lang": "ja",
+    }
+    headers = {"Content-Type": "application/json"}
+    response = requests.post(local_url, json=data, headers=headers)
+    if response.status_code == 200:
+        with open(filename, "wb") as f:
+            f.write(response.content)
+        print(f"✅ TTS 合成成功: {filename}")
+        return filename
+    else:
+        print(f"❌ TTS 失败: {response.text}")
+        return None
 
 
 def chatbot_interface(user_input: str, history: List[Tuple[str, str]], kb_flag: bool):
@@ -159,14 +214,15 @@ def chatbot_interface(user_input: str, history: List[Tuple[str, str]], kb_flag: 
     print(f"[历史记录] 共{len(history)}条，最近5条：{history[-5:] if history else '无历史'}")
 
     history.append((user_input, ""))
-    yield format_history_for_gradio(history), history, ""
+    # 第一次 yield（清空输入框、暂时没有音频）
+    yield format_history_for_gradio(history), history, "", None
 
     callback = GradioStreamCallback()
 
     def on_token(token: str, **kwargs):
         callback.tokens += token
-        with_cot = add_cot_tags(callback.tokens)
-        history[-1] = (user_input, with_cot)
+        # history 里存的是原始文本（无 HTML）
+        history[-1] = (user_input, callback.tokens)
 
     callback.on_llm_new_token = on_token
 
@@ -177,35 +233,42 @@ def chatbot_interface(user_input: str, history: List[Tuple[str, str]], kb_flag: 
 
     def invoke_chain():
         try:
-             # ===== 使用memory而不是手动format =====
+            # ===== 使用memory而不是手动format =====
             memory.chat_memory.add_user_message(user_input)
-    
+
             if kb_flag:
                 # 用知识库检索并拼接上下文
                 context = "\n".join([f"{u}：{a}" for u, a in history[-10:]])
                 rewrite_result = rewrite_chain.invoke({"history": context, "question": user_input})
-                search_query = rewrite_result.content if hasattr(rewrite_result, "content") else rewrite_result
-    
+                search_query = rewrite_result["text"]
+
+                # 调用检索器拿结构化知识
                 docs = retriever._get_relevant_documents(search_query)
-                context_text = "\n\n".join(doc.page_content for doc in docs)
-                print(f"context_text: {context_text}")
+
+                # 这里将结构化知识的文本先拼接起来，传给摘要chain转换成自然语言
+                raw_knowledge = "\n".join(doc.page_content for doc in docs)
+                natural_language_knowledge = summary_chain.invoke({"raw_knowledge": raw_knowledge})
+                natural_language_knowledge = natural_language_knowledge["text"]
+                natural_language_knowledge = re.sub(r"<think>.*?</think>", "", natural_language_knowledge,
+                                                    flags=re.DOTALL)
+                print(f"[转换后的自然语言知识]: {natural_language_knowledge}")
+
                 qa_input = {
                     "question": user_input,
-                    "context": docs,
+                    "context": natural_language_knowledge,
                     **memory.load_memory_variables({})
                 }
                 stuff_chain.invoke(qa_input, config={"callbacks": [callback]})
-    
+
             else:
                 inputs = {"question": user_input, **memory.load_memory_variables({})}
                 messages = simple_chat_prompt.format_messages(**inputs)
                 base_llm.invoke(messages, config={"callbacks": [callback]})
-                
+
             # 把模型回答写入memory
             memory.chat_memory.add_ai_message(callback.tokens)
         finally:
             done_flag.set()
-
 
     thread = threading.Thread(target=invoke_chain)
     thread.start()
@@ -214,15 +277,25 @@ def chatbot_interface(user_input: str, history: List[Tuple[str, str]], kb_flag: 
     while not done_flag.is_set() or last_len < len(callback.tokens):
         if len(callback.tokens) > last_len:
             last_len = len(callback.tokens)
-            with_cot = add_cot_tags(callback.tokens)
-            styled_text = process_cot_tags(with_cot)
-            yield format_history_for_gradio(history[:-1] + [(user_input, styled_text)]), history, ""
+            # 仅用于显示的 HTML
+            styled_text = process_cot_tags(add_cot_tags(callback.tokens))
+            yield format_history_for_gradio(history[:-1] + [(user_input, styled_text)]), history, "", None
         time.sleep(0.1)
 
     thread.join()
 
     print("[模型回答]:", callback.tokens)
+
+    history[-1] = (user_input, callback.tokens)
+    # 调用TTS
+    # === 去除心理活动内容再生成音频 ===
+    tts_text = remove_inner_brackets(callback.tokens)
+    tts_file = synthesize_speech(tts_text, filename="output.wav")
+    # 最终返回4个值（包含语音路径）
+    styled_text = process_cot_tags(add_cot_tags(callback.tokens))
+    yield format_history_for_gradio(history[:-1] + [(user_input, styled_text)]), history, "", tts_file
     print("======================================\n")
+
 
 css_style = """
 /* 页面基础样式，左右水平居中 */
@@ -372,21 +445,22 @@ body {
     font-size: 14px;
 }
 """
-    
+
+
 def clear_all():
     memory.clear()  # 清空 langchain 内存
-    return [], []
-    
+    return [], [], "", None
+
+
 def toggle_kb_fn(current_state: bool):
     new_state = not current_state
     label = "知识库: 开启" if new_state else "知识库: 关闭"
     return new_state, label
 
 
-    
 with gr.Blocks(css=css_style) as demo:
     with gr.Column(elem_id="main-container"):
-        gr.Markdown("### 🌸 本间心铃 - 智能对话系统 (Galgame风格)")
+        gr.Markdown("### 🌸 本间心铃 - 智能对话系统")
 
         chatbot = gr.Chatbot(elem_id="chatbot", label="对话", type="messages")
 
@@ -395,23 +469,24 @@ with gr.Blocks(css=css_style) as demo:
             with gr.Column(elem_classes="input-container"):
                 msg = gr.Textbox(show_label=False, placeholder="和心铃说点什么吧…", lines=1)
                 send = gr.Button("➤", elem_classes="send-btn")
-
         # 按钮区：清空 + 知识库切换
         with gr.Row():
             clear = gr.Button("清空对话", elem_classes="clear-btn")
             toggle_kb = gr.Button("知识库: 开启", elem_classes="clear-btn")
+        with gr.Row():
+            audio_player = gr.Audio(label="语音播放", type="filepath", autoplay=True)
 
         # 状态
-        state = gr.State([])       # 聊天历史
-        kb_state = gr.State(True) # 知识库状态
+        state = gr.State([])  # 聊天历史
+        kb_state = gr.State(True)  # 知识库状态
 
-        send.click(fn=chatbot_interface, inputs=[msg, state, kb_state], outputs=[chatbot, state, msg])
-        msg.submit(fn=chatbot_interface, inputs=[msg, state, kb_state], outputs=[chatbot, state, msg])
+        send.click(fn=chatbot_interface, inputs=[msg, state, kb_state],
+                   outputs=[chatbot, state, msg, audio_player])
+        msg.submit(fn=chatbot_interface, inputs=[msg, state, kb_state],
+                   outputs=[chatbot, state, msg, audio_player])
 
-
-        clear.click(clear_all, None, [chatbot, state, kb_state], queue=False)
+        clear.click(clear_all, None, [chatbot, state, msg, audio_player], queue=False)
         toggle_kb.click(fn=toggle_kb_fn, inputs=[kb_state], outputs=[kb_state, toggle_kb])
-
 
 demo.launch(server_name="0.0.0.0", server_port=7860)
 
